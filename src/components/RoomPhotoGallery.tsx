@@ -12,10 +12,11 @@ interface Props {
 }
 
 export default function RoomPhotoGallery({ roomId }: Props) {
-  const [photos, setPhotos]     = useState<RoomPhoto[]>([])
-  const [loading, setLoading]   = useState(true)
+  const [photos, setPhotos]       = useState<RoomPhoto[]>([])
+  const [loading, setLoading]     = useState(true)
+  const [loadErr, setLoadErr]     = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [lightbox, setLightbox] = useState<number | null>(null)
+  const [lightbox, setLightbox]   = useState<number | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   // ── 초기 로드 + 실시간 구독 ──────────────────────────────
@@ -23,43 +24,66 @@ export default function RoomPhotoGallery({ roomId }: Props) {
   useEffect(() => {
     let mounted = true
 
-    supabase
-      .from('room_photos')
-      .select('*')
-      .eq('room_id', roomId)
-      .order('created_at', { ascending: true })
-      .then(({ data }) => {
-        if (mounted) {
-          setPhotos((data ?? []) as RoomPhoto[])
-          setLoading(false)
-        }
-      })
+    // async/await + try-catch-finally 로 loading 이 반드시 해제되도록
+    const load = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('room_photos')
+          .select('*')
+          .eq('room_id', roomId)
+          .order('created_at', { ascending: true })
 
-    const channel = supabase
-      .channel(`room-photos-${roomId}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
-        (payload) => {
-          if (!mounted) return
-          const photo = payload.new as RoomPhoto
-          setPhotos((prev) => prev.some((p) => p.id === photo.id) ? prev : [...prev, photo])
-        },
-      )
-      .on(
-        'postgres_changes',
-        { event: 'DELETE', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
-        (payload) => {
-          if (!mounted) return
-          const id = (payload.old as { id: string }).id
-          setPhotos((prev) => prev.filter((p) => p.id !== id))
-        },
-      )
-      .subscribe()
+        if (!mounted) return
+        if (error) {
+          console.warn('[RoomPhotoGallery] DB error:', error.message)
+          // 테이블 미생성 등 에러 → 빈 배열로 처리 (기능 비활성화하지 않음)
+          setPhotos([])
+          setLoadErr(true)
+        } else {
+          setPhotos((data ?? []) as RoomPhoto[])
+        }
+      } catch (e) {
+        if (!mounted) return
+        console.warn('[RoomPhotoGallery] fetch error:', e)
+        setLoadErr(true)
+      } finally {
+        if (mounted) setLoading(false)
+      }
+    }
+
+    load()
+
+    // Realtime 채널 — 에러가 나도 컴포넌트 crash 방지
+    let channel: ReturnType<typeof supabase.channel> | null = null
+    try {
+      channel = supabase
+        .channel(`room-photos-${roomId}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
+          (payload) => {
+            if (!mounted) return
+            const photo = payload.new as RoomPhoto
+            setPhotos((prev) => prev.some((p) => p.id === photo.id) ? prev : [...prev, photo])
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'DELETE', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
+          (payload) => {
+            if (!mounted) return
+            const id = (payload.old as { id: string }).id
+            setPhotos((prev) => prev.filter((p) => p.id !== id))
+          },
+        )
+        .subscribe()
+    } catch (e) {
+      console.warn('[RoomPhotoGallery] realtime error:', e)
+    }
 
     return () => {
       mounted = false
-      supabase.removeChannel(channel)
+      if (channel) supabase.removeChannel(channel)
     }
   }, [roomId])
 
@@ -95,7 +119,6 @@ export default function RoomPhotoGallery({ roomId }: Props) {
           useWebWorker: true,
         })
         const photo = await uploadRoomPhoto(roomId, compressed, uploader)
-        // 낙관적 추가 (realtime이 dedup 처리)
         setPhotos((prev) =>
           prev.some((p) => p.id === photo.id) ? prev : [...prev, photo],
         )
@@ -124,16 +147,29 @@ export default function RoomPhotoGallery({ roomId }: Props) {
 
   return (
     <>
-      <div className="px-4 pt-4 pb-3">
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2.5">
-          방 사진{photos.length > 0 && ` · ${photos.length}장`}
-        </p>
+      <div className="px-4 pt-4 pb-4 border-b border-gray-100">
+
+        {/* 섹션 헤더 */}
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-sm font-bold text-gray-700">
+            📷 방 사진
+            {photos.length > 0 && (
+              <span className="ml-1.5 text-xs font-normal text-gray-400">{photos.length}장</span>
+            )}
+          </p>
+          {/* 에러 배지 */}
+          {loadErr && (
+            <span className="text-[10px] text-amber-500 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
+              SQL 스키마 설치 필요
+            </span>
+          )}
+        </div>
 
         {loading ? (
           /* 스켈레톤 */
           <div className="grid grid-cols-3 gap-1.5">
             {[1, 2, 3].map((i) => (
-              <div key={i} className="aspect-square bg-gray-100 rounded-xl animate-pulse" />
+              <div key={i} className="aspect-square bg-gray-200 rounded-xl animate-pulse" />
             ))}
           </div>
         ) : (
@@ -141,7 +177,7 @@ export default function RoomPhotoGallery({ roomId }: Props) {
             {photos.map((photo, i) => (
               <div
                 key={photo.id}
-                className="aspect-square bg-gray-100 rounded-xl overflow-hidden cursor-pointer relative"
+                className="aspect-square bg-gray-100 rounded-xl overflow-hidden cursor-pointer relative group"
                 onClick={() => setLightbox(i)}
               >
                 <img
@@ -171,12 +207,12 @@ export default function RoomPhotoGallery({ roomId }: Props) {
             <button
               onClick={() => inputRef.current?.click()}
               disabled={uploading}
-              className="aspect-square border-2 border-dashed border-violet-200 rounded-xl flex flex-col items-center justify-center gap-1 text-violet-400 hover:border-violet-400 hover:bg-violet-50 transition-colors disabled:opacity-60"
+              className="aspect-square border-2 border-dashed border-violet-300 rounded-xl flex flex-col items-center justify-center gap-1 text-violet-500 hover:border-violet-500 hover:bg-violet-50 active:bg-violet-100 transition-colors disabled:opacity-60 bg-violet-50/50"
             >
-              <span className={`text-2xl leading-none ${uploading ? 'animate-spin' : ''}`}>
+              <span className={`text-2xl leading-none font-light ${uploading ? 'animate-spin' : ''}`}>
                 {uploading ? '↻' : '+'}
               </span>
-              <span className="text-[10px]">
+              <span className="text-[10px] font-medium">
                 {uploading ? '올리는 중…' : '사진 추가'}
               </span>
             </button>
