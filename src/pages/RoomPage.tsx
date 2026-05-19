@@ -1,9 +1,16 @@
+import imageCompression from 'browser-image-compression'
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { nanoid } from 'nanoid'
-import { supabase, type Room, type RoomEntry } from '../lib/supabase'
+import {
+  supabase,
+  uploadRoomPhoto,
+  getRoomPhotoUrl,
+  type Room,
+  type RoomEntry,
+  type RoomPhoto,
+} from '../lib/supabase'
 import StarRating from '../components/StarRating'
-import RoomPhotoGallery from '../components/RoomPhotoGallery'
 
 // ── 작성자별 카드 색상 ──────────────────────────────────────
 
@@ -35,15 +42,22 @@ export default function RoomPage() {
   const { roomId } = useParams<{ roomId: string }>()
   const navigate = useNavigate()
 
-  const [room, setRoom]       = useState<Room | null>(null)
-  const [entries, setEntries] = useState<RoomEntry[]>([])
-  const [loading, setLoading] = useState(true)
+  // ── 룸 / 후기 state ──────────────────────────────────────
+  const [room, setRoom]         = useState<Room | null>(null)
+  const [entries, setEntries]   = useState<RoomEntry[]>([])
+  const [loading, setLoading]   = useState(true)
   const [notFound, setNotFound] = useState(false)
   const [urlCopied, setUrlCopied] = useState(false)
-
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  // ── 데이터 로드 + Realtime ──────────────────────────────
+  // ── 사진 state ───────────────────────────────────────────
+  const [photos, setPhotos]           = useState<RoomPhoto[]>([])
+  const [photosLoading, setPhotosLoading] = useState(true)
+  const [uploading, setUploading]     = useState(false)
+  const [lightbox, setLightbox]       = useState<number | null>(null)
+  const photoInputRef = useRef<HTMLInputElement>(null)
+
+  // ── 룸 + 후기 로드 + Realtime ───────────────────────────
 
   useEffect(() => {
     if (!roomId) return
@@ -99,6 +113,81 @@ export default function RoomPage() {
     }
   }, [roomId])
 
+  // ── 사진 로드 + Realtime ────────────────────────────────
+
+  useEffect(() => {
+    if (!roomId) return
+    let mounted = true
+
+    const loadPhotos = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('room_photos')
+          .select('*')
+          .eq('room_id', roomId)
+          .order('created_at', { ascending: true })
+
+        if (!mounted) return
+        if (error) {
+          console.warn('[photos] load error:', error.message)
+        } else {
+          setPhotos((data ?? []) as RoomPhoto[])
+        }
+      } catch (e) {
+        console.warn('[photos] fetch error:', e)
+      } finally {
+        if (mounted) setPhotosLoading(false)
+      }
+    }
+
+    loadPhotos()
+
+    let photoCh: ReturnType<typeof supabase.channel> | null = null
+    try {
+      photoCh = supabase
+        .channel(`room-photos-${roomId}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
+          (payload) => {
+            if (!mounted) return
+            const photo = payload.new as RoomPhoto
+            setPhotos((prev) => prev.some((p) => p.id === photo.id) ? prev : [...prev, photo])
+          },
+        )
+        .on(
+          'postgres_changes',
+          { event: 'DELETE', schema: 'public', table: 'room_photos', filter: `room_id=eq.${roomId}` },
+          (payload) => {
+            if (!mounted) return
+            const id = (payload.old as { id: string }).id
+            setPhotos((prev) => prev.filter((p) => p.id !== id))
+          },
+        )
+        .subscribe()
+    } catch (e) {
+      console.warn('[photos] realtime error:', e)
+    }
+
+    return () => {
+      mounted = false
+      if (photoCh) supabase.removeChannel(photoCh)
+    }
+  }, [roomId])
+
+  // ── 라이트박스 키보드 ───────────────────────────────────
+
+  useEffect(() => {
+    if (lightbox === null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft')  setLightbox((i) => (i !== null && i > 0 ? i - 1 : i))
+      if (e.key === 'ArrowRight') setLightbox((i) => (i !== null && i < photos.length - 1 ? i + 1 : i))
+      if (e.key === 'Escape')     setLightbox(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox, photos.length])
+
   // ── URL 복사 ────────────────────────────────────────────
 
   const copyUrl = async () => {
@@ -107,11 +196,50 @@ export default function RoomPage() {
     setTimeout(() => setUrlCopied(false), 2000)
   }
 
-  // ── 항목 삭제 ───────────────────────────────────────────
+  // ── 후기 삭제 ───────────────────────────────────────────
 
   const deleteEntry = async (entryId: string) => {
     if (!window.confirm('이 후기를 삭제할까요?')) return
     await supabase.from('room_entries').delete().eq('id', entryId)
+  }
+
+  // ── 사진 업로드 ─────────────────────────────────────────
+
+  const handlePhotoChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
+    e.target.value = ''
+    if (!files.length || !roomId) return
+
+    const uploader = localStorage.getItem('boardduk:roomAuthor') ?? null
+    setUploading(true)
+    try {
+      for (const file of files) {
+        const compressed = await imageCompression(file, {
+          maxWidthOrHeight: 1280,
+          initialQuality: 0.75,
+          useWebWorker: true,
+        })
+        const photo = await uploadRoomPhoto(roomId, compressed, uploader)
+        setPhotos((prev) => prev.some((p) => p.id === photo.id) ? prev : [...prev, photo])
+      }
+    } catch (err) {
+      alert('업로드 실패: ' + (err as Error).message)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // ── 사진 삭제 ───────────────────────────────────────────
+
+  const handlePhotoDelete = async (photo: RoomPhoto, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!window.confirm('이 사진을 삭제할까요?')) return
+    try {
+      await supabase.storage.from('room-photos').remove([photo.storage_path])
+      await supabase.from('room_photos').delete().eq('id', photo.id)
+    } catch (err) {
+      alert('삭제 실패: ' + (err as Error).message)
+    }
   }
 
   // ── 렌더 ────────────────────────────────────────────────
@@ -140,7 +268,8 @@ export default function RoomPage() {
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
-      {/* 헤더 */}
+
+      {/* ── 헤더 ── */}
       <header className="sticky top-0 bg-white border-b border-gray-100 z-10">
         <div className="max-w-lg mx-auto flex items-center h-14 px-4 gap-2">
           <button onClick={() => navigate('/')} className="text-gray-500 text-sm shrink-0">
@@ -163,12 +292,79 @@ export default function RoomPage() {
         </div>
       </header>
 
-      {/* 사진 갤러리 */}
-      <div className="max-w-lg w-full mx-auto bg-white border-b border-gray-100">
-        <RoomPhotoGallery roomId={roomId!} />
+      {/* ── 사진 갤러리 (인라인) ── */}
+      <div className="w-full bg-white border-b-4 border-gray-200">
+        <div className="max-w-lg mx-auto px-4 pt-4 pb-4">
+          <p className="text-sm font-bold text-gray-800 mb-3">
+            📷 방 사진
+            {photos.length > 0 && (
+              <span className="ml-1.5 text-xs font-normal text-gray-400">{photos.length}장</span>
+            )}
+          </p>
+
+          {photosLoading ? (
+            <div className="grid grid-cols-3 gap-2">
+              <div className="aspect-square rounded-xl bg-gray-200 animate-pulse" />
+              <div className="aspect-square rounded-xl bg-gray-200 animate-pulse" />
+              <div className="aspect-square rounded-xl bg-gray-200 animate-pulse" />
+            </div>
+          ) : (
+            <div className="grid grid-cols-3 gap-2">
+              {photos.map((photo, i) => (
+                <div
+                  key={photo.id}
+                  className="aspect-square rounded-xl overflow-hidden relative cursor-pointer bg-gray-100"
+                  onClick={() => setLightbox(i)}
+                >
+                  <img
+                    src={getRoomPhotoUrl(photo.storage_path)}
+                    alt={`사진 ${i + 1}`}
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                  />
+                  <button
+                    onClick={(e) => handlePhotoDelete(photo, e)}
+                    className="absolute top-1 right-1 w-6 h-6 bg-black/60 text-white rounded-full text-sm flex items-center justify-center"
+                    aria-label="삭제"
+                  >
+                    ×
+                  </button>
+                  {photo.uploader && (
+                    <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent text-white text-[9px] px-1.5 py-1 truncate">
+                      {photo.uploader}
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {/* 업로드 버튼 */}
+              <button
+                onClick={() => photoInputRef.current?.click()}
+                disabled={uploading}
+                className="aspect-square rounded-xl border-2 border-dashed border-violet-400 bg-violet-50 flex flex-col items-center justify-center gap-1 text-violet-500 hover:bg-violet-100 active:bg-violet-200 transition-colors disabled:opacity-50"
+              >
+                <span className={`text-3xl leading-none ${uploading ? 'animate-spin' : ''}`}>
+                  {uploading ? '↻' : '+'}
+                </span>
+                <span className="text-[11px] font-semibold">
+                  {uploading ? '올리는 중…' : '사진 추가'}
+                </span>
+              </button>
+            </div>
+          )}
+
+          <input
+            ref={photoInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={handlePhotoChange}
+          />
+        </div>
       </div>
 
-      {/* 항목 목록 */}
+      {/* ── 후기 목록 ── */}
       <div className="flex-1 max-w-lg w-full mx-auto px-4 py-4 space-y-3">
         {entries.length === 0 && (
           <div className="py-16 text-center text-gray-400 text-sm">
@@ -182,7 +378,7 @@ export default function RoomPage() {
         <div ref={bottomRef} />
       </div>
 
-      {/* 입력 폼 */}
+      {/* ── 입력 폼 ── */}
       <div className="sticky bottom-0 bg-white border-t border-gray-100 shadow-lg">
         <div className="max-w-lg mx-auto px-4 py-3">
           <EntryForm roomId={roomId!} onSubmitted={(entry) => {
@@ -191,6 +387,48 @@ export default function RoomPage() {
           }} />
         </div>
       </div>
+
+      {/* ── 라이트박스 ── */}
+      {lightbox !== null && photos[lightbox] && (
+        <div
+          className="fixed inset-0 bg-black/95 z-50 flex items-center justify-center"
+          onClick={() => setLightbox(null)}
+        >
+          <img
+            src={getRoomPhotoUrl(photos[lightbox].storage_path)}
+            alt="전체화면"
+            className="max-w-full max-h-full object-contain select-none"
+            onClick={(e) => e.stopPropagation()}
+            draggable={false}
+          />
+          {lightbox > 0 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setLightbox(lightbox - 1) }}
+              className="absolute left-3 top-1/2 -translate-y-1/2 w-10 h-10 bg-white/20 hover:bg-white/30 text-white rounded-full flex items-center justify-center text-2xl"
+            >‹</button>
+          )}
+          {lightbox < photos.length - 1 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setLightbox(lightbox + 1) }}
+              className="absolute right-3 top-1/2 -translate-y-1/2 w-10 h-10 bg-white/20 hover:bg-white/30 text-white rounded-full flex items-center justify-center text-2xl"
+            >›</button>
+          )}
+          <button
+            onClick={() => setLightbox(null)}
+            className="absolute top-4 right-4 w-9 h-9 bg-white/20 hover:bg-white/30 text-white rounded-full flex items-center justify-center"
+          >✕</button>
+          <div className="absolute bottom-8 left-0 right-0 flex flex-col items-center gap-1.5">
+            {photos[lightbox].uploader && (
+              <span className="bg-black/50 text-white text-xs px-3 py-1 rounded-full">
+                📷 {photos[lightbox].uploader}
+              </span>
+            )}
+            <span className="bg-black/40 text-white/70 text-xs px-3 py-1 rounded-full">
+              {lightbox + 1} / {photos.length}
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -241,15 +479,13 @@ function EntryForm({
   roomId: string
   onSubmitted: (entry: RoomEntry) => void
 }) {
-  const [expanded, setExpanded] = useState(false)
-  const [author, setAuthor] = useState(
-    () => localStorage.getItem('boardduk:roomAuthor') ?? '',
-  )
-  const [rating, setRating]   = useState(0)
-  const [summary, setSummary] = useState('')
-  const [moment, setMoment]   = useState('')
+  const [expanded, setExpanded]   = useState(false)
+  const [author, setAuthor]       = useState(() => localStorage.getItem('boardduk:roomAuthor') ?? '')
+  const [rating, setRating]       = useState(0)
+  const [summary, setSummary]     = useState('')
+  const [moment, setMoment]       = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [errors, setErrors] = useState<{ author?: string; summary?: string }>({})
+  const [errors, setErrors]       = useState<{ author?: string; summary?: string }>({})
 
   const handleSubmit = async () => {
     const errs: typeof errors = {}
@@ -295,7 +531,6 @@ function EntryForm({
 
   return (
     <div className="space-y-2.5">
-      {/* 이름 + 별점 */}
       <div className="flex gap-2 items-start">
         <div className="flex-1">
           <input
@@ -311,7 +546,6 @@ function EntryForm({
         <StarRating value={rating} onChange={setRating} size="sm" />
       </div>
 
-      {/* 소감 */}
       <div>
         <textarea
           value={summary}
@@ -326,7 +560,6 @@ function EntryForm({
         {errors.summary && <p className="text-red-500 text-xs -mt-1">{errors.summary}</p>}
       </div>
 
-      {/* 기억에 남는 순간 */}
       <textarea
         value={moment}
         onChange={(e) => setMoment(e.target.value)}
@@ -336,7 +569,6 @@ function EntryForm({
         className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-violet-400"
       />
 
-      {/* 버튼 */}
       <div className="flex gap-2">
         <button
           onClick={() => setExpanded(false)}
