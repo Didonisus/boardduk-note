@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { nanoid } from 'nanoid'
 import { supabase, type Room, type RoomEntry } from '../lib/supabase'
 import StarRating from '../components/StarRating'
+import RoomPhotoGallery from '../components/RoomPhotoGallery'
 
 // ── 작성자별 카드 색상 ──────────────────────────────────────
 
@@ -161,6 +162,11 @@ export default function RoomPage() {
           </button>
         </div>
       </header>
+
+      {/* 사진 갤러리 */}
+      <div className="max-w-lg w-full mx-auto bg-white border-b border-gray-100">
+        <RoomPhotoGallery roomId={roomId!} />
+      </div>
 
       {/* 항목 목록 */}
       <div className="flex-1 max-w-lg w-full mx-auto px-4 py-4 space-y-3">
