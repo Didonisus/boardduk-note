@@ -4,16 +4,18 @@ import NewNotePage from './pages/NewNotePage'
 import NoteDetailPage from './pages/NoteDetailPage'
 import SharePage from './pages/SharePage'
 import SettingsPage from './pages/SettingsPage'
+import RoomPage from './pages/RoomPage'
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/"          element={<HomePage />} />
-        <Route path="/new"       element={<NewNotePage />} />
-        <Route path="/note/:id"  element={<NoteDetailPage />} />
-        <Route path="/share"     element={<SharePage />} />
-        <Route path="/settings"  element={<SettingsPage />} />
+        <Route path="/"            element={<HomePage />} />
+        <Route path="/new"         element={<NewNotePage />} />
+        <Route path="/note/:id"    element={<NoteDetailPage />} />
+        <Route path="/share"       element={<SharePage />} />
+        <Route path="/settings"    element={<SettingsPage />} />
+        <Route path="/room/:roomId" element={<RoomPage />} />
       </Routes>
     </BrowserRouter>
   )
